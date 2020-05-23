@@ -6,8 +6,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"runtime/debug"
-	//"github.com/alecthomas/mph"
+	"sync"
+	"time"
 )
+
+var nBytesToMatch int = 8
 
 func singlehash(plain []byte, key []byte) []byte {
 	data := make([]byte, 8)
@@ -23,13 +26,6 @@ func singlehash(plain []byte, key []byte) []byte {
 }
 
 func singleDehash(key, hash []byte) []byte {
-	//this line has the real data from the problem
-	//data := [2][]byte{[]byte("\xda\x99\xd1\xea\x64\x14\x4f\x3e"), []byte("\x59\xa3\x44\x2d\x8b\xab\xcf\x84")}
-
-	//this is the provided test case
-	//data := [1][]byte{[]byte("\xf3\x15\x06\x47\x12\x20\xcd\x8f")}
-
-	//this is my test case with encode by 241 and decode by 123
 	data := hash
 
 	dehashed := make([]byte, 8)
@@ -44,57 +40,56 @@ func singleDehash(key, hash []byte) []byte {
 	return dehashed
 }
 
-func intToString(counter uint64) []byte {
+func intToString(counter uint) []byte {
 	bs := make([]byte, 8)
 	i := uint64(counter)
 	binary.LittleEndian.PutUint64(bs, i)
 	return bs
 }
 
-func getInt2(s []byte) uint64 {
-	var res uint64
+func getInt2(s []byte) uint {
+	var res uint
 	for _, v := range s {
 		res <<= 8
-		res |= uint64(v)
+		res |= uint(v)
 	}
 	return res
 }
 
-func encryptWithAllKeys(start uint64, nToGenerate uint64, c chan [2][]uint64) {
-	keys := make([]uint64, nToGenerate)
-	values := make([]uint64, nToGenerate)
+func encryptWithAllKeys(start uint, encryptionKeys []uint, hashes []uint, wg *sync.WaitGroup) {
 	plain := []byte("weakhash")
-	mask := uint64(0x01010101)
+	mask := uint(0x0101010101010101)
 	counter := start
+	nToGen := uint(len(encryptionKeys))
 
-	for i := uint64(0); i < nToGenerate; i++ {
+	defer wg.Done()
+
+	for i := uint(0); i < nToGen; i++ {
 		counter = (counter | mask) + 1
 		key := intToString(counter)
 		result := singlehash(plain, key)
-		store := getInt2(result[:8])
+		store := getInt2(result[:nBytesToMatch])
 
-		//keys refers to encryption keys. The output hash is the dictionary key. THis is needlessly confusing
-		keys[i] = store
-		values[i] = getInt2(key)
+		//keys refers to encryption keys. The output hash is the dictionary key. This is needlessly confusing
+		encryptionKeys[i] = counter
+		hashes[i] = store
 		//fmt.Printf("%x, %x, %x\n", keys[i], getInt2(result), values[i])
-		i++
 
 	}
-	r := [2][]uint64{keys, values}
-	c <- r
-	fmt.Printf("generated %d hashes from %x to %x \n", nToGenerate, start, counter)
+	//fmt.Printf("generated %d hashes from %x to %x \n", nToGen, start, counter)
 }
 
-func decryptWithAllKeys(start uint64, nToGenerate uint64, hashtable *HMap, c chan [2]uint64) {
+func decryptWithAllKeys(start uint, nToGenerate uint, hashtable *HMap, c chan [2]uint) {
 	//data := []byte(0x59a3442d8babcf84)
+	startTime := time.Now()
 	data := [2][]byte{[]byte("\xda\x99\xd1\xea\x64\x14\x4f\x3e"), []byte("\x59\xa3\x44\x2d\x8b\xab\xcf\x84")}
 
 	dehashed := make([]byte, 8)
-	mask := uint64(0x0101010101010101)
+	mask := uint(0x0101010101010101)
 	counter := start
 
 	//fmt.Printf("calculating from %v to %v\n", counter, stop)
-	for i := uint64(0); i < nToGenerate; i++ {
+	for i := uint(0); i < nToGenerate; i++ {
 		counter = (counter | mask) + 1
 		key := intToString(counter)
 		cipher, err := des.NewCipher(key)
@@ -103,18 +98,18 @@ func decryptWithAllKeys(start uint64, nToGenerate uint64, hashtable *HMap, c cha
 		}
 		for _, hash := range data {
 			cipher.Decrypt(dehashed, hash)
-			store := getInt2(dehashed[:8])
+			store := getInt2(dehashed[:nBytesToMatch])
 
 			if k, ok := hashtable.Lookup(store); ok {
-				fmt.Printf("Key generated from int %x encrypt and int %x found for hash %x \n", k, counter, hash)
+				fmt.Printf("Key generated from int 0x%x encrypt and int 0x%x found for hash %x in %v\n", k, counter, hash, time.Now().Sub(startTime))
 				fmt.Printf("%x from %x\n", store, dehashed)
-				res := [2]uint64{k, counter}
+				res := [2]uint{k, counter}
 				c <- res
 				return
 			}
 		}
 	}
-	res := [2]uint64{0, 0}
+	res := [2]uint{0, 0}
 
 	c <- res
 
@@ -122,55 +117,72 @@ func decryptWithAllKeys(start uint64, nToGenerate uint64, hashtable *HMap, c cha
 
 func meetInTheMiddle() {
 
-	nHashToGenerate := uint64(1 << 30)
-	nHashToCheck := uint64(1 << 35)
-	nThreads := uint64(8)
+	nHashToGenerate := uint(1 << 31)
+	nHashToCheck := uint(1 << 36)
+	nThreads := uint(8)
 
 	nGenPerThread := nHashToGenerate / nThreads
 	nCheckPerThread := nHashToCheck / nThreads
-	c := make(chan [2][]uint64, nThreads)
+
+	var wg sync.WaitGroup
+
 	fmt.Println("starting threads")
 
-	increment32 := uint64(1 << 29)
-	increment64 := uint64(1 << 36)
-	for i := uint64(0); i < nThreads*increment32; i += increment32 {
-		start := i
+	increment := uint(1 << 53)
+	encryptkeys := make([]uint, int(nHashToGenerate))
+	fmt.Printf("allocated space for %v operations\n", len(encryptkeys))
+	hashvalues := make([]uint, int(nHashToGenerate))
+	arrayStart := uint(0)
 
-		fmt.Printf("hash gen thread for %x to %x started\n", start, start+8*nGenPerThread)
-		go encryptWithAllKeys(start, nGenPerThread, c)
+	fmt.Printf("generating hashes\n")
+	start := time.Now()
+	for i := uint(0); i < nThreads*increment; i += increment {
+		wg.Add(1)
+		start := i | 0x0101010101010101
+		arrayEnd := arrayStart + nGenPerThread
+
+		//fmt.Printf("hash gen thread for %x to %x started\n", start, start+8*nGenPerThread)
+		go encryptWithAllKeys(start, encryptkeys[arrayStart:arrayEnd], hashvalues[arrayStart:arrayEnd], &wg)
+		//fmt.Println(arrayStart, arrayEnd)
+		arrayStart = arrayEnd
 	}
+	wg.Wait()
+	doneHashing := time.Now()
+	fmt.Printf("generated %v hashes in %v\n", nHashToGenerate, doneHashing.Sub(start))
 
-	kvps := [2][]uint64{}
-	for i := uint64(0); i < nThreads; i++ {
-		r := <-c
-		kvps[0] = append(kvps[0], r[0]...)
-		kvps[1] = append(kvps[1], r[1]...)
-
+	fmt.Println("generating dictionary")
+	hashtable := NewHMap(hashvalues, encryptkeys)
+	nonzero := 0
+	for i := uint(0); i < nHashToGenerate; i++ {
+		if hashtable.Keys[i] != 0 {
+			nonzero++
+			//fmt.Printf("hash %x from key %x\n", hashtable.Keys[i], hashtable.Values[i])
+		}
 	}
-	fmt.Println("generating keys")
-	hashtable := NewHMap(kvps)
-	//fmt.Println(hashtable.KVPairs)
-	fmt.Printf("generated all hashes\n")
+	doneDict := time.Now()
+	fmt.Printf("Fixed up dictionary in %v\n", doneDict.Sub(doneHashing))
 
-	output := make(chan [2]uint64, nThreads)
+	output := make(chan [2]uint, nThreads)
 	//op := len(hashtable)
-	for i := uint64(0); i < nThreads*increment64; i += increment64 {
-		start := i
-
-		fmt.Printf("hash check thread for %x to %x started\n", start, start+8*nCheckPerThread)
+	for i := uint(0); i < nThreads*increment; i += increment {
+		start := i | 0x0101010101010101
 		go decryptWithAllKeys(start, nCheckPerThread, hashtable, output)
 
 	}
-	final := make([][2]uint64, nThreads)
-	for i := uint64(0); i < nThreads; i++ {
+	final := make([][2]uint, nThreads)
+	for i := uint(0); i < nThreads; i++ {
 		final[i] = <-output
 	}
 	fmt.Println(final)
 }
 
-func validate(key1, key2 []byte) []byte {
-	//key1 := intToString(135390567628899252)
-	//key2 := intToString(126383387400464336)
+func validate(encrypt, decrypt uint) []byte {
+
+	key1 := intToString(encrypt)
+	key2 := intToString(decrypt)
+
+	fmt.Printf("key1 is %x, key2 is %x \n", getInt2(key1), getInt2(key2))
+
 	plain := []byte("weakhash")
 
 	fullKey := append(key1, key2...)
@@ -192,10 +204,9 @@ func main() {
 	GCPercent := 5
 	prev := debug.SetGCPercent(GCPercent)
 	fmt.Printf("set GC to %d, prev was %d\n", GCPercent, prev)
-	//key := []byte("Hello World")
-	key1 := intToString(14602670969953714176)
-	key2 := intToString(72340378996529506)
-	validate(key1, key2)
-	meetInTheMiddle()
+
+	validate(0x1c101010175cfb0, 0x161010101010104)
+
+	//meetInTheMiddle()
 
 }

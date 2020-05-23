@@ -5,10 +5,14 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"sync"
+	"time"
 
 	//"github.com/alecthomas/mph"
 	"runtime/debug"
 )
+
+var nToMatch int = 8
 
 func singlehash(plain []byte, key []byte) []byte {
 	data := make([]byte, 8)
@@ -24,13 +28,6 @@ func singlehash(plain []byte, key []byte) []byte {
 }
 
 func singleDehash(key, hash []byte) []byte {
-	//this line has the real data from the problem
-	//data := [2][]byte{[]byte("\xda\x99\xd1\xea\x64\x14\x4f\x3e"), []byte("\x59\xa3\x44\x2d\x8b\xab\xcf\x84")}
-
-	//this is the provided test case
-	//data := [1][]byte{[]byte("\xf3\x15\x06\x47\x12\x20\xcd\x8f")}
-
-	//this is my test case with encode by 241 and decode by 123
 	data := hash
 
 	dehashed := make([]byte, 8)
@@ -61,27 +58,29 @@ func getInt2(s []byte) uint {
 	return res
 }
 
-func encryptWithAllKeys(start uint, nToGenerate uint, c chan map[uint]uint) {
-	r := make(map[uint]uint, nToGenerate)
+func encryptWithAllKeys(start uint, nToGenerate uint, hashtable map[uint]uint, mutex *sync.Mutex, wg *sync.WaitGroup) {
 	plain := []byte("weakhash")
-	mask := uint(0x01010101)
+	mask := uint(0x0101010101010101)
 	counter := start
+
+	defer wg.Done()
 
 	for i := uint(0); i < nToGenerate; i++ {
 		counter = (counter | mask) + 1
 		key := intToString(counter)
 		result := singlehash(plain, key)
-		store := getInt2(result[:8])
+		store := getInt2(result[:nToMatch])
 
-		r[store] = counter
-		i++
+		mutex.Lock()
+		hashtable[store] = counter
+		mutex.Unlock()
 	}
-	c <- r
-	fmt.Printf("generated %d hashes from %x to %x \n", nToGenerate, start, counter)
+
 }
 
 func decryptWithAllKeys(start uint, nToGenerate uint, hashtable map[uint]uint, c chan [2]uint) {
 	//data := []byte(0x59a3442d8babcf84)
+	startTime := time.Now()
 	data := [2][]byte{[]byte("\xda\x99\xd1\xea\x64\x14\x4f\x3e"), []byte("\x59\xa3\x44\x2d\x8b\xab\xcf\x84")}
 
 	dehashed := make([]byte, 8)
@@ -98,10 +97,10 @@ func decryptWithAllKeys(start uint, nToGenerate uint, hashtable map[uint]uint, c
 		}
 		for _, hash := range data {
 			cipher.Decrypt(dehashed, hash)
-			store := getInt2(dehashed[:8])
+			store := getInt2(dehashed[:nToMatch])
 
 			if k, ok := hashtable[store]; ok {
-				fmt.Printf("Key generated from int %x encrypt and int %x found for hash %x \n", k, counter, hash)
+				fmt.Printf("Key generated from int 0x%x encrypt and int 0x%x found for hash %x in %v\n", k, counter, hash, time.Now().Sub(startTime))
 				res := [2]uint{uint(k), counter}
 				c <- res
 				return
@@ -116,42 +115,36 @@ func decryptWithAllKeys(start uint, nToGenerate uint, hashtable map[uint]uint, c
 
 func meetInTheMiddle() {
 
-	nHashToGenerate := uint(1 << 29)
+	nHashToGenerate := uint(1 << 30)
 	nHashToCheck := uint(1 << 36)
 	nThreads := uint(8)
 
 	nGenPerThread := nHashToGenerate / nThreads
 	nCheckPerThread := nHashToCheck / nThreads
-	c := make(chan map[uint]uint, nThreads)
+
 	fmt.Println("starting threads")
 
-	increment32 := uint(1 << 29)
-	increment64 := uint(1 << 36)
-	for i := uint(0); i < nThreads*increment32; i += increment32 {
-		start := i
-
-		fmt.Printf("hash gen thread for %x to %x started\n", start, start+8*nGenPerThread)
-		go encryptWithAllKeys(start, nGenPerThread, c)
-	}
-
+	increment := uint(1 << 53)
 	hashtable := make(map[uint]uint, nHashToGenerate)
-	for i := uint(0); i < nThreads; i++ {
-		r := <-c
-		for k, v := range r {
-			hashtable[k] = v
-			delete(r, k)
-		}
-		r = nil
-	}
+	var mutex = &sync.Mutex{}
+	var wg sync.WaitGroup
 
-	fmt.Printf("generated all %d hashes\n", len(hashtable))
+	start := time.Now()
+
+	for i := uint(0); i < nThreads*increment; i += increment {
+		start := i | 0x0101010101010101
+		wg.Add(1)
+		go encryptWithAllKeys(start, nGenPerThread, hashtable, mutex, &wg)
+	}
+	wg.Wait()
+	elapsed := time.Now().Sub(start)
+	fmt.Printf("generated %v hashes in %v \n", nHashToGenerate, elapsed)
 
 	output := make(chan [2]uint, nThreads)
 	//op := len(hashtable)
-	for i := uint(0); i < nThreads*increment64; i += increment64 {
-		start := i
+	for i := uint(0); i < nThreads*increment; i += increment {
+		start := i | 0x0101010101010101
 
-		fmt.Printf("hash check thread for %x to %x started\n", start, start+8*nCheckPerThread)
 		go decryptWithAllKeys(start, nCheckPerThread, hashtable, output)
 
 	}
